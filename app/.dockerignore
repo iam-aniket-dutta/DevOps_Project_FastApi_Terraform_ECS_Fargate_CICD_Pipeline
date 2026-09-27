@@ -1,0 +1,27 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Test caches and coverage reports
+.pytest_cache/
+.coverage
+htmlcov/
+tests/
+
+# Git and editor files
+.git/
+.gitignore
+.dockerignore
+.vscode/
+.idea/
+
+# Documentation
+*.md
