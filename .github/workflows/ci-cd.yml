@@ -144,20 +144,20 @@ jobs:
       - name: "7. Push to ECR (tag = git SHA + latest)"
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         id: build-and-push
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          REPO_NAME: ${{ env.ECR_REPOSITORY || 'fastapi-ecs-dev-repo' }}
-          IMAGE_TAG: ${{ steps.set-tag.outputs.image_tag }}
-          LOCAL_IMAGE: ${{ steps.set-tag.outputs.image_local }}
         run: |
-          IMAGE_URI="$ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG"
-          LATEST_URI="$ECR_REGISTRY/$REPO_NAME:latest"
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          REPO="${ECR_REPOSITORY:-fastapi-ecs-dev-repo}"
+          TAG="${{ steps.set-tag.outputs.image_tag }}"
+          LOCAL_IMAGE="${{ steps.set-tag.outputs.image_local }}"
+
+          IMAGE_URI="${REGISTRY}/${REPO}:${TAG}"
+          LATEST_URI="${REGISTRY}/${REPO}:latest"
 
           echo "Tagging image for Amazon ECR: $IMAGE_URI and $LATEST_URI"
           docker tag "$LOCAL_IMAGE" "$IMAGE_URI"
           docker tag "$LOCAL_IMAGE" "$LATEST_URI"
 
-          echo "Pushing Git SHA image tag ($IMAGE_TAG) to Amazon ECR..."
+          echo "Pushing Git SHA image tag ($TAG) to Amazon ECR..."
           docker push "$IMAGE_URI"
 
           echo "Pushing latest image tag to Amazon ECR..."
@@ -182,6 +182,26 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr-deploy
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve Deployment Image URI
+        id: image-info
+        run: |
+          IMAGE="${{ needs.build-and-scan.outputs.image_uri }}"
+          if [ -z "$IMAGE" ]; then
+            echo "needs.build-and-scan.outputs.image_uri was empty. Resolving directly from ECR registry..."
+            REGISTRY="${{ steps.login-ecr-deploy.outputs.registry }}"
+            REPO="${ECR_REPOSITORY:-fastapi-ecs-dev-repo}"
+            TAG="${{ github.sha }}"
+            IMAGE="${REGISTRY}/${REPO}:${TAG}"
+            echo "Constructed fallback image URI: $IMAGE"
+          else
+            echo "Using image URI from build stage: $IMAGE"
+          fi
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
       - name: Record Current (Pre-Deploy) Task Definition Revision
         id: pre-deploy-info
@@ -212,7 +232,7 @@ jobs:
         with:
           task-definition: task-definition.json
           container-name: ${{ env.CONTAINER_NAME || 'fastapi-ecs-dev-container' }}
-          image: ${{ needs.build-and-scan.outputs.image_uri }}
+          image: ${{ steps.image-info.outputs.image }}
 
       # Step 8: Deploy Amazon ECS Task Definition (Keeps previous revisions intact)
       - name: "8. Deploy (task definition/service)"
@@ -295,7 +315,7 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           ACTOR: ${{ github.actor }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          IMAGE_URI: ${{ needs.build-and-scan.outputs.image_uri }}
+          IMAGE_URI: ${{ steps.image-info.outputs.image }}
           PREV_TASK_DEF: ${{ steps.pre-deploy-info.outputs.prev_task_def }}
         run: |
           echo "=========================================================="
