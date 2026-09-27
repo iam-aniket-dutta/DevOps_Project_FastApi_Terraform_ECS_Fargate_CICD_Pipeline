@@ -1,0 +1,355 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  # Defaults match the Terraform infrastructure provisioned in the deploy/ folder
+  AWS_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY || vars.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER || vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE || vars.ECS_SERVICE }}
+  ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION || vars.ECS_TASK_DEFINITION }}
+  CONTAINER_NAME: ${{ secrets.CONTAINER_NAME || vars.CONTAINER_NAME }}
+  ALB_NAME: ${{ secrets.ALB_NAME || vars.ALB_NAME }}
+  ALB_DNS_NAME: ${{ secrets.ALB_DNS_NAME || vars.ALB_DNS_NAME }}
+
+jobs:
+  # ============================================================================
+  # STAGE 1: Code Quality, Linting & Unit Testing
+  # [1. Checkout -> 2. Install deps/cache -> 3. Lint -> 4. Unit tests coverage]
+  # ============================================================================
+  lint-and-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Checkout repository code
+      - name: "1. Checkout repository"
+        uses: actions/checkout@v4
+
+      # Step 2: Install dependencies with caching enabled
+      - name: "2. Install deps/cache"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Application & Test Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pytest-cov
+          pip install -r app/requirements.txt
+
+      # Step 3: Linting with Flake8 (Python) and syntax check (JavaScript)
+      - name: "3. Lint (flake8/eslint)"
+        run: |
+          echo "=========================================================="
+          echo "Running Flake8 Python syntax & runtime checks..."
+          echo "=========================================================="
+          flake8 app --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=.venv,venv
+
+          echo "Running Flake8 code style & formatting checks (max length: 127)..."
+          flake8 app --count --max-line-length=127 --statistics --exclude=.venv,venv
+          echo "✅ Flake8 Python linting passed!"
+
+          echo "Running JavaScript syntax validation on app/static/app.js..."
+          node --check app/static/app.js
+          echo "✅ JavaScript syntax validation passed!"
+
+      # Step 4: Unit tests & code coverage report
+      - name: "4. Unit tests coverage report"
+        run: |
+          echo "=========================================================="
+          echo "Running Pytest suite with code coverage..."
+          echo "=========================================================="
+          pytest -v --cov=app --cov-report=term-missing --cov-report=xml:coverage.xml app/tests | tee pytest_output.txt
+
+          # Publish coverage summary directly to GitHub Step Summary
+          echo "### 📊 Unit Tests & Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          tail -n 20 pytest_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # STAGE 2: Build & DevSecOps Security Scanning
+  # [5. Build Docker image -> 6. Vulnerability scan (Trivy) -> 7. Push to ECR]
+  # ============================================================================
+  build-and-scan:
+    name: Build & Security Scan
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
+      image_uri: ${{ steps.build-and-push.outputs.image_uri }}
+      image_local: ${{ steps.set-tag.outputs.image_local }}
+    steps:
+      - name: "1. Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: Set Image Tag Metadata
+        id: set-tag
+        run: |
+          REPO_NAME="${ECR_REPOSITORY:-fastapi-ecs-dev-repo}"
+          IMAGE_TAG="${{ github.sha }}"
+          LOCAL_IMAGE="${REPO_NAME}:${IMAGE_TAG}"
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image_local=$LOCAL_IMAGE" >> $GITHUB_OUTPUT
+          echo "Local build tag: $LOCAL_IMAGE"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 5: Build Docker image locally
+      - name: "5. Build Docker image"
+        run: |
+          echo "Building Docker image: ${{ steps.set-tag.outputs.image_local }}"
+          docker build \
+            --tag "${{ steps.set-tag.outputs.image_local }}" \
+            ./app
+          echo "Docker build completed successfully."
+
+      # Step 6: DevSecOps Vulnerability Scan with Aqua Security Trivy
+      - name: "6. Vulnerability scan"
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.set-tag.outputs.image_local }}
+          format: "table"
+          exit-code: "0" # Audit mode (can be set to 1 to block pipeline on CRITICAL vulnerabilities)
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+
+      # Step 7: Push to Amazon ECR (Runs only on push to main)
+      - name: Configure AWS Credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: "7. Push to ECR (tag = git SHA + latest)"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: build-and-push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPO_NAME: ${{ env.ECR_REPOSITORY || 'fastapi-ecs-dev-repo' }}
+          IMAGE_TAG: ${{ steps.set-tag.outputs.image_tag }}
+          LOCAL_IMAGE: ${{ steps.set-tag.outputs.image_local }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG"
+          LATEST_URI="$ECR_REGISTRY/$REPO_NAME:latest"
+
+          echo "Tagging image for Amazon ECR: $IMAGE_URI and $LATEST_URI"
+          docker tag "$LOCAL_IMAGE" "$IMAGE_URI"
+          docker tag "$LOCAL_IMAGE" "$LATEST_URI"
+
+          echo "Pushing Git SHA image tag ($IMAGE_TAG) to Amazon ECR..."
+          docker push "$IMAGE_URI"
+
+          echo "Pushing latest image tag to Amazon ECR..."
+          docker push "$LATEST_URI"
+
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Successfully pushed to ECR: $IMAGE_URI and $LATEST_URI"
+
+  # ============================================================================
+  # STAGE 3: Deploy, Smoke Test & Notifications (Runs ONLY on Push to Main)
+  # [8. Deploy -> 9. Post-deploy smoke test -> 10. Notify]
+  # ============================================================================
+  deploy:
+    name: Deploy & Verify
+    needs: build-and-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Record Current (Pre-Deploy) Task Definition Revision
+        id: pre-deploy-info
+        run: |
+          CLUSTER="${ECS_CLUSTER:-fastapi-ecs-dev-cluster}"
+          SERVICE="${ECS_SERVICE:-fastapi-ecs-dev-service}"
+          echo "Checking active task definition before deployment..."
+          PREV_TASK_DEF=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query "services[0].taskDefinition" \
+            --output text 2>/dev/null || echo "NONE")
+          echo "Previous active task definition ARN: $PREV_TASK_DEF"
+          echo "prev_task_def=$PREV_TASK_DEF" >> $GITHUB_OUTPUT
+
+      - name: Download Active Task Definition
+        run: |
+          FAMILY="${ECS_TASK_DEFINITION:-fastapi-ecs-dev-task}"
+          echo "Downloading latest active task definition for family '$FAMILY'..."
+          aws ecs describe-task-definition \
+            --task-definition "$FAMILY" \
+            --query taskDefinition > task-definition.json
+          echo "Task definition downloaded successfully to task-definition.json."
+
+      - name: Render Image Tag in Task Definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME || 'fastapi-ecs-dev-container' }}
+          image: ${{ needs.build-and-scan.outputs.image_uri }}
+
+      # Step 8: Deploy Amazon ECS Task Definition (Keeps previous revisions intact)
+      - name: "8. Deploy (task definition/service)"
+        id: deploy-task-def
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE || 'fastapi-ecs-dev-service' }}
+          cluster: ${{ env.ECS_CLUSTER || 'fastapi-ecs-dev-cluster' }}
+          wait-for-service-stability: true
+
+      # Step 9: Post-Deploy Smoke Test (Curls ALB /api/health with N retries)
+      - name: "9. Post-deploy smoke test"
+        id: smoke-test
+        env:
+          TARGET_ALB_NAME: ${{ env.ALB_NAME || 'fastapi-ecs-dev-alb' }}
+          TARGET_ALB_DNS: ${{ env.ALB_DNS_NAME }}
+          HEALTH_PATH: "/api/health"
+          MAX_RETRIES: 12
+          RETRY_INTERVAL: 10
+        run: |
+          ALB_HOST="$TARGET_ALB_DNS"
+          if [ -z "$ALB_HOST" ]; then
+            echo "ALB_DNS_NAME not set. Querying AWS ELB API for '$TARGET_ALB_NAME'..."
+            ALB_HOST=$(aws elbv2 describe-load-balancers \
+              --names "$TARGET_ALB_NAME" \
+              --query "LoadBalancers[0].DNSName" \
+              --output text 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$ALB_HOST" ] || [ "$ALB_HOST" = "None" ]; then
+            echo "::error::Could not resolve ALB DNS name. Set ALB_DNS_NAME secret or ensure ALB '$TARGET_ALB_NAME' exists."
+            exit 1
+          fi
+
+          HEALTH_URL="http://${ALB_HOST}${HEALTH_PATH}"
+          echo "=========================================================="
+          echo "Starting Post-Deploy Smoke Test against: $HEALTH_URL"
+          echo "Max Retries: $MAX_RETRIES | Interval: ${RETRY_INTERVAL}s"
+          echo "=========================================================="
+
+          attempt=1
+          success=false
+
+          while [ $attempt -le $MAX_RETRIES ]; do
+            echo "Attempt $attempt of $MAX_RETRIES: curling $HEALTH_URL ..."
+            HTTP_STATUS=$(curl -s -o /tmp/smoke_resp.json -w "%{http_code}" --connect-timeout 5 --max-time 10 "$HEALTH_URL" || echo "000")
+            echo "HTTP Status Code: $HTTP_STATUS"
+
+            if [ -f /tmp/smoke_resp.json ]; then
+              echo "Response Body: $(cat /tmp/smoke_resp.json)"
+            fi
+
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              echo "✅ Smoke test PASSED on attempt $attempt! ALB returned HTTP 200 OK."
+              success=true
+              echo "smoke_status=PASSED" >> $GITHUB_OUTPUT
+              break
+            else
+              echo "⚠️ Attempt $attempt failed (Status: $HTTP_STATUS). Retrying in ${RETRY_INTERVAL}s..."
+              sleep $RETRY_INTERVAL
+              attempt=$((attempt + 1))
+            fi
+          done
+
+          if [ "$success" = false ]; then
+            echo "::error::❌ Smoke test FAILED after $MAX_RETRIES attempts. Health endpoint $HEALTH_URL did not return HTTP 200."
+            echo "Previous Task Definition ARN before this deploy was: ${{ steps.pre-deploy-info.outputs.prev_task_def }}"
+            echo "To rollback, run the manual 'Rollback ECS Service' workflow in GitHub Actions."
+            echo "smoke_status=FAILED" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      # Step 10: Notify (Slack & GitHub Actions Status Summary)
+      - name: "10. Notify (Slack/GitHub status)"
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          JOB_STATUS: ${{ job.status }}
+          COMMIT_SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          IMAGE_URI: ${{ needs.build-and-scan.outputs.image_uri }}
+          PREV_TASK_DEF: ${{ steps.pre-deploy-info.outputs.prev_task_def }}
+        run: |
+          echo "=========================================================="
+          echo "Generating Pipeline Status Notification..."
+          echo "=========================================================="
+
+          # 1. Publish GitHub Actions Step Summary
+          if [ "$JOB_STATUS" = "success" ]; then
+            STATUS_EMOJI="✅ SUCCESS"
+          else
+            STATUS_EMOJI="❌ FAILED"
+          fi
+
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ## 🚀 Deployment Summary: ${STATUS_EMOJI}
+
+          | Item | Detail |
+          |---|---|
+          | **Status** | **${STATUS_EMOJI}** |
+          | **Triggered By** | \`${ACTOR}\` |
+          | **Commit SHA** | [\`${COMMIT_SHA}\`](${RUN_URL}) |
+          | **Deployed Image** | \`${IMAGE_URI}\` |
+          | **ECS Cluster** | \`${{ env.ECS_CLUSTER || 'fastapi-ecs-dev-cluster' }}\` |
+          | **ECS Service** | \`${{ env.ECS_SERVICE || 'fastapi-ecs-dev-service' }}\` |
+          | **Pre-Deploy Task Def** | \`${PREV_TASK_DEF}\` |
+          | **Smoke Test** | \`${{ steps.smoke-test.outputs.smoke_status || 'SKIPPED' }}\` |
+
+          > [!NOTE]
+          > If deployment health check failed, execute the manual **Rollback ECS Service** workflow to restore the previous revision.
+          EOF
+
+          # 2. Send Slack Notification if webhook is configured
+          if [ -n "$SLACK_WEBHOOK" ]; then
+            echo "Sending notification to Slack webhook..."
+            COLOR="danger"
+            [ "$JOB_STATUS" = "success" ] && COLOR="good"
+
+            curl -s -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"attachments\": [
+                  {
+                    \"color\": \"${COLOR}\",
+                    \"title\": \"AWS ECS Deployment: ${STATUS_EMOJI}\",
+                    \"title_link\": \"${RUN_URL}\",
+                    \"fields\": [
+                      {\"title\": \"Commit\", \"value\": \"${COMMIT_SHA}\", \"short\": true},
+                      {\"title\": \"Actor\", \"value\": \"${ACTOR}\", \"short\": true},
+                      {\"title\": \"Image\", \"value\": \"${IMAGE_URI}\", \"short\": false},
+                      {\"title\": \"Cluster / Service\", \"value\": \"${{ env.ECS_CLUSTER || 'fastapi-ecs-dev-cluster' }} / ${{ env.ECS_SERVICE || 'fastapi-ecs-dev-service' }}\", \"short\": true}
+                    ],
+                    \"footer\": \"DevOps ECS Fargate CI/CD Pipeline\"
+                  }
+                ]
+              }" "$SLACK_WEBHOOK" || echo "Warning: Failed to deliver Slack webhook notification."
+          else
+            echo "SLACK_WEBHOOK_URL secret not configured. Skipping Slack notification."
+          fi

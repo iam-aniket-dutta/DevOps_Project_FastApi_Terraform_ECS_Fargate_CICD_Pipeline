@@ -8,8 +8,8 @@ APP_DIR = Path(__file__).resolve().parent.parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from main import app, store
-from models import ItemCreate
+from main import app, store  # noqa: E402
+from models import ItemCreate  # noqa: E402
 
 client = TestClient(app)
 

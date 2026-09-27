@@ -1,0 +1,180 @@
+name: Rollback ECS Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_revision:
+        description: "Specific Task Definition Revision number to roll back to (e.g. 2). Leave blank to rollback to the immediately previous revision."
+        required: false
+        default: ""
+      reason:
+        description: "Reason for manual rollback"
+        required: false
+        default: "Manual rollback triggered from GitHub Actions"
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER || vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE || vars.ECS_SERVICE }}
+  ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION || vars.ECS_TASK_DEFINITION }}
+  ALB_NAME: ${{ secrets.ALB_NAME || vars.ALB_NAME }}
+  ALB_DNS_NAME: ${{ secrets.ALB_DNS_NAME || vars.ALB_DNS_NAME }}
+
+jobs:
+  rollback:
+    name: Rollback to Prior Revision
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION || 'us-east-1' }}
+
+      - name: Resolve Target Task Definition Revision
+        id: resolve-target
+        run: |
+          CLUSTER="${ECS_CLUSTER:-fastapi-ecs-dev-cluster}"
+          SERVICE="${ECS_SERVICE:-fastapi-ecs-dev-service}"
+          FAMILY="${ECS_TASK_DEFINITION:-fastapi-ecs-dev-task}"
+
+          echo "=========================================================="
+          echo "Rolling back ECS Service: $SERVICE (Cluster: $CLUSTER)"
+          echo "Rollback reason: ${{ github.event.inputs.reason }}"
+          echo "=========================================================="
+
+          # Query the currently active task definition from the running service
+          CURRENT_TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query "services[0].taskDefinition" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$CURRENT_TASK_DEF_ARN" ] || [ "$CURRENT_TASK_DEF_ARN" = "None" ]; then
+            echo "::error::Could not find active task definition for service '$SERVICE' in cluster '$CLUSTER'."
+            exit 1
+          fi
+
+          echo "Currently active Task Definition ARN: $CURRENT_TASK_DEF_ARN"
+
+          # Extract family and current revision number
+          CURRENT_DEF_NAME=$(echo "$CURRENT_TASK_DEF_ARN" | awk -F'/' '{print $NF}')
+          CURRENT_FAMILY=$(echo "$CURRENT_DEF_NAME" | cut -d':' -f1)
+          CURRENT_REV=$(echo "$CURRENT_DEF_NAME" | cut -d':' -f2)
+
+          echo "Current Task Family: $CURRENT_FAMILY"
+          echo "Current Active Revision: $CURRENT_REV"
+
+          USER_SPECIFIED_REV="${{ github.event.inputs.target_revision }}"
+
+          if [ -n "$USER_SPECIFIED_REV" ]; then
+            TARGET_REV="$USER_SPECIFIED_REV"
+            echo "User requested specific target revision: $TARGET_REV"
+          else
+            TARGET_REV=$((CURRENT_REV - 1))
+            echo "Auto-detected previous revision: $TARGET_REV"
+          fi
+
+          if [ "$TARGET_REV" -le 0 ]; then
+            echo "::error::Invalid rollback target revision: $TARGET_REV. Target revision must be >= 1."
+            exit 1
+          fi
+
+          TARGET_TASK_DEF="${CURRENT_FAMILY}:${TARGET_REV}"
+          echo "Verifying target task definition '$TARGET_TASK_DEF' in AWS ECS..."
+
+          STATUS=$(aws ecs describe-task-definition \
+            --task-definition "$TARGET_TASK_DEF" \
+            --query "taskDefinition.status" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "::error::Task definition revision '$TARGET_TASK_DEF' does not exist in AWS ECS."
+            exit 1
+          fi
+
+          echo "Target task definition '$TARGET_TASK_DEF' verified (Status: $STATUS)."
+          echo "target_task_def=$TARGET_TASK_DEF" >> $GITHUB_OUTPUT
+          echo "current_rev=$CURRENT_REV" >> $GITHUB_OUTPUT
+          echo "target_rev=$TARGET_REV" >> $GITHUB_OUTPUT
+
+      - name: Re-point ECS Service to Prior Revision
+        run: |
+          CLUSTER="${ECS_CLUSTER:-fastapi-ecs-dev-cluster}"
+          SERVICE="${ECS_SERVICE:-fastapi-ecs-dev-service}"
+          TARGET="${{ steps.resolve-target.outputs.target_task_def }}"
+
+          echo "Updating ECS service '$SERVICE' to point to '$TARGET'..."
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$TARGET"
+
+          echo "Waiting for ECS service '$SERVICE' to reach steady state on '$TARGET'..."
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE"
+          echo "Rollback deployment completed! Service is running on revision: $TARGET"
+
+      # ========================================================================
+      # Post-Rollback Smoke Test: Confirm recovery via ALB /api/health
+      # ========================================================================
+      - name: Post-Rollback Smoke Test (ALB Health Endpoint)
+        env:
+          TARGET_ALB_NAME: ${{ env.ALB_NAME || 'fastapi-ecs-dev-alb' }}
+          TARGET_ALB_DNS: ${{ env.ALB_DNS_NAME }}
+          HEALTH_PATH: "/api/health"
+          MAX_RETRIES: 12
+          RETRY_INTERVAL: 10
+        run: |
+          ALB_HOST="$TARGET_ALB_DNS"
+          if [ -z "$ALB_HOST" ]; then
+            echo "ALB_DNS_NAME not set. Querying AWS ELB API for '$TARGET_ALB_NAME'..."
+            ALB_HOST=$(aws elbv2 describe-load-balancers \
+              --names "$TARGET_ALB_NAME" \
+              --query "LoadBalancers[0].DNSName" \
+              --output text 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$ALB_HOST" ] || [ "$ALB_HOST" = "None" ]; then
+            echo "::warning::Could not resolve ALB DNS Name. Skipping post-rollback curl smoke test."
+            exit 0
+          fi
+
+          HEALTH_URL="http://${ALB_HOST}${HEALTH_PATH}"
+          echo "=========================================================="
+          echo "Starting Post-Rollback Smoke Test against: $HEALTH_URL"
+          echo "Max Retries: $MAX_RETRIES | Interval: ${RETRY_INTERVAL}s"
+          echo "=========================================================="
+
+          attempt=1
+          success=false
+
+          while [ $attempt -le $MAX_RETRIES ]; do
+            echo "Attempt $attempt of $MAX_RETRIES: curling $HEALTH_URL ..."
+            HTTP_STATUS=$(curl -s -o /tmp/rollback_resp.json -w "%{http_code}" --connect-timeout 5 --max-time 10 "$HEALTH_URL" || echo "000")
+            echo "HTTP Status Code: $HTTP_STATUS"
+
+            if [ -f /tmp/rollback_resp.json ]; then
+              echo "Response: $(cat /tmp/rollback_resp.json)"
+            fi
+
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              echo "✅ Post-rollback smoke test PASSED on attempt $attempt! ALB returned HTTP 200 OK."
+              success=true
+              break
+            else
+              echo "⚠️ Attempt $attempt failed (Status: $HTTP_STATUS). Retrying in ${RETRY_INTERVAL}s..."
+              sleep $RETRY_INTERVAL
+              attempt=$((attempt + 1))
+            fi
+          done
+
+          if [ "$success" = false ]; then
+            echo "::error::❌ Post-rollback smoke test FAILED after $MAX_RETRIES attempts."
+            exit 1
+          fi
