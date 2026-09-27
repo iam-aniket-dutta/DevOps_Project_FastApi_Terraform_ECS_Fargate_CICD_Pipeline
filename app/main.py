@@ -60,6 +60,24 @@ class InMemoryStore:
                 "category": "Study",
                 "status": "Completed",
             },
+            {
+                "title": "Configure ECS Task Definition",
+                "description": "Configure ECS Task Definition",
+                "category": "DevOps",
+                "status": "Pending",
+            },
+            {
+                "title": "Build infrastruture using Terraform.",
+                "description": "Build infrastruture using Terraform.",
+                "category": "DevOps",
+                "status": "In Progress",
+            },
+            {
+                "title": "Build CI/CD pipeline using Github Actions.",
+                "description": "Build CI/CD pipeline using Github Actions.",
+                "category": "DevOps",
+                "status": "Pending",
+            },
         ]
         for item in sample_items:
             self.create(
